@@ -1,0 +1,172 @@
+\documentclass[UTF-8]{ctexbeamer}
+\usetheme{Boadilla}
+
+\usepackage{listing}
+\usepackage{minted}
+
+\title{First-class async in rCore}
+\subtitle{设计方案}
+
+\author{g01 - 王宇逸, 刘晓义}
+\date{2020-3}
+
+\begin{document}
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{What are we doing?}
+
+  Rust 有一个叫做 Async 的东西
+
+  \begin{minted}{rust}
+    async fn foo() -> u64 {
+      let result = bar().await;
+      println!("Got result: {}", result);
+      result
+    }
+  \end{minted}
+
+  \vspace{1em}
+
+  我们希望能够用 Async 和 Future 来完成内核中的并行工作，包括：
+  \begin{itemize}
+    \item 处理同步互斥
+    \item 驱动用户线程
+    \item 处理中断
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{But why?}
+
+  \textbf{因为 Future 很便宜。}
+  
+  使用 \texttt{async fn} 得到的 Future 会由编译器静态计算出所需的空间，然后被放到堆上，这样就不需要对其他线程分配内核栈，也不需要担心内核栈爆炸了。
+
+  \vspace{1em}
+
+  \textbf{因为 Future 很方便。}
+
+  \textbf{内建}了通知机制，同时有很多 Combinator 可以用。如果需要在内核内实现一个请求超时：
+
+  {
+    \scriptsize
+  \begin{minted}{rust}
+    async fn read(f: File, buf: &mut [u8], timeout: Duration)
+      -> Result<usize, Error> {
+        select! {
+          len = f.read_into(buf) => Ok(len),
+          () => timer::timeout(timeout) => Err(Error::Timeout),
+        }
+      }
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}
+  \frametitle{Previously...}
+
+  有哪些有关的社区工作呢？
+  \pause
+  \begin{itemize}
+    \item \textbf{futures:} 提供了很多 Combinators，虽然和 Scheduler 无关，但是在构建 Primitive Future 的时候，因为没办法直接用 async fn，这些组合子基本是一定要用的。
+    \pause
+    \item \textbf{Tokio \& async-std \& futures 的 executor:} 依赖 \texttt{std::sync::Mutex} 进行同步，还有 \texttt{std::thread::Thread} 创建进程池。其中后者在 Scheduler 内部连替代都写不出来。
+    \pause
+    \item \textbf{很多 no-std executor}: 只是在调用线程上同步执行，而且由于没有 Sync primitives，所以也没有异步消息。
+    \pause
+    \item \textbf{async-task:} 不是一个完整的 Executor，而是 Task 的抽象，处理了 Wake up 相关的逻辑。具体谁来 Poll，以及按照什么顺序 Poll，需要另外完成。
+  \end{itemize}
+
+\end{frame}
+\begin{frame}
+  \frametitle{Previously... Cont.}
+  可以用 futures 的组合字和 async-task 的 Task 抽象，部分 Task 的组件 (Waker, etc.) 性能可能稍逊色于手动实现，除此以外还需要实现：
+  \begin{itemize}
+    \item 最基本的异步单元：Timeout, Mutex, Channel, ...
+    \item Run queue 本身
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{基础设施}
+
+  \begin{itemize}
+    \item softirq: 中断队列
+    \item timer: 计时器
+    \item userspace manager: 将用户态对内核态的接口包装为 Future
+    \item synchronization primitives: Mutex, Condvar, Channels...
+    \item executor: 执行 Future
+  \end{itemize}
+
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{基础设施 Cont.}
+
+  这些模块提供以下的 Primitives
+  \vspace{1em}
+
+  {
+  \scriptsize
+  \begin{minted}{rust}
+    fn irq::wait_for(int: Interrupt) -> impl Future<Item = InterruptInfo>;
+    fn timer::timeout(dur: Duration) -> impl Future<Item = InterruptInfo>;
+
+    enum ut::Event { Syscall(Syscall), TimeUp, Signal(Signal) }
+    impl ut::UserThread {
+      fn run() -> impl Future<Item = Event>;
+    }
+
+    impl<T: Sync> sync::Mutex<T> {
+      fn wait_until<F: Fn(&mut self, &mut T) -> bool>(pred: F)
+        -> impl Future<Item = Guard<T>>;
+    }
+
+    impl exec::Executor {
+      fn spawn(fut: Future<Item = ()>);
+    }
+    fn exec::yield() -> impl Future<Item = ()>;
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{Example}
+
+  \scriptsize
+  \begin{minted}{rust}
+    async fn create_user_thread(us: UserThread, sig: Signals) {
+      match us.run().await {
+        Event::TimeUp => yield().await;
+        Event::Syscall(Syscall::Exit(code)) => {
+          us.notify_waiter(/* ... */);
+          return;
+        },
+        Event::Syscall(Syscall::Sleep(spec)) => {
+          let dur: Duration = spec.into();
+          timer::timeout(dur).await;
+        }
+        Event::Signal(Signal::Kill) => {
+          us.notify_waiter(/* ... */);
+          return ();
+        }
+        // ...
+      }
+    }
+  \end{minted}
+\end{frame}
+
+\begin{frame}
+  \frametitle{Progress?}
+
+  \begin{itemize}
+    \item 实现了 Timer, Channel, Executor 的底层数据结构
+    \item API 设计
+    \item 调查了之前社区进行的工作
+  \end{itemize}
+\end{frame}
+  
+\end{document}

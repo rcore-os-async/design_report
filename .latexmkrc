@@ -1,4 +1,4 @@
 $pdf_mode = 1;
 $dvi_mode = $postscript_mode = 0; 
-$pdflatex = "xelatex %O %S";
-@default_files = ('W6.tex');
+$pdflatex = "xelatex --shell-escape %O %S";
+@default_files = ('design.tex');
