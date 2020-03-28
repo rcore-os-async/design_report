@@ -2,7 +2,7 @@
 \usetheme{Boadilla}
 
 \usepackage{listing}
-\usepackage{minted}
+\usepackage[cache=false]{minted}
 
 \title{First-class async in rCore}
 \subtitle{设计方案}
@@ -42,7 +42,7 @@
   \frametitle{But why?}
 
   \textbf{因为 Future 很便宜。}
-  
+
   使用 \texttt{async fn} 得到的 Future 会由编译器静态计算出所需的空间，然后被放到堆上，这样就不需要对其他线程分配内核栈，也不需要担心内核栈爆炸了。
 
   \vspace{1em}
@@ -52,7 +52,7 @@
   \textbf{内建}了通知机制，同时有很多 Combinator 可以用。如果需要在内核内实现一个请求超时：
 
   {
-    \scriptsize
+  \scriptsize
   \begin{minted}{rust}
     async fn read(f: File, buf: &mut [u8], timeout: Duration)
       -> Result<usize, Error> {
@@ -72,11 +72,11 @@
   \pause
   \begin{itemize}
     \item \textbf{futures:} 提供了很多 Combinators，虽然和 Scheduler 无关，但是在构建 Primitive Future 的时候，因为没办法直接用 async fn，这些组合子基本是一定要用的。
-    \pause
+          \pause
     \item \textbf{Tokio \& async-std \& futures 的 executor:} 依赖 \texttt{std::sync::Mutex} 进行同步，还有 \texttt{std::thread::Thread} 创建进程池。其中后者在 Scheduler 内部连替代都写不出来。
-    \pause
+          \pause
     \item \textbf{很多 no-std executor}: 只是在调用线程上同步执行，而且由于没有 Sync primitives，所以也没有异步消息。
-    \pause
+          \pause
     \item \textbf{async-task:} 不是一个完整的 Executor，而是 Task 的抽象，处理了 Wake up 相关的逻辑。具体谁来 Poll，以及按照什么顺序 Poll，需要另外完成。
   \end{itemize}
 
@@ -110,8 +110,8 @@
   \vspace{1em}
 
   {
-  \scriptsize
-  \begin{minted}{rust}
+    \scriptsize
+    \begin{minted}{rust}
     fn irq::wait_for(int: Interrupt) -> impl Future<Item = InterruptInfo>;
     fn timer::timeout(dur: Duration) -> impl Future<Item = InterruptInfo>;
 
@@ -159,6 +159,113 @@
   \end{minted}
 \end{frame}
 
+\begin{frame}[fragile]
+  \frametitle{Rust的Future架构}
+
+  Rust只提供Future等一系列基础类型，最重要的是Future。
+  {
+  \scriptsize
+  \begin{minted}{rust}
+    pub enum Poll<T> {
+      Ready(T),
+      Pending,
+    }
+
+    pub trait Future {
+      type Output;
+      fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>;
+    }
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{SleepFuture的实现}
+
+  如何把Future与已经实现的timer结合起来？
+  {
+  \scriptsize
+  \begin{minted}{rust}
+    struct SleepFuture {
+      pub shared_state: Arc<Mutex<SleepSharedState>>,
+    }
+
+    struct SleepSharedState {
+      completed: bool,
+      waker: Option<Waker>,
+    }
+
+    impl SleepFuture {
+      pub fn new() -> Self {
+        let shared_state = Arc::new(Mutex::new(SleepSharedState {
+          completed: false,
+          waker: None,
+        }));
+        SleepFuture {
+          shared_state: shared_state,
+        }
+      }
+    }
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{SleepFuture的实现}
+
+  这是一个Future的通用实现，后面也可以考虑重用这部分代码来写其它的Future。
+  {
+  \scriptsize
+  \begin{minted}{rust}
+    impl Future for SleepFuture {
+      type Output = ();
+      fn poll(self: Pin<&mut Self>, cx: &mut FutureContext<'_>) -> Poll<Self::Output> {
+        let mut shared_state = self.shared_state.lock();
+        if shared_state.completed {
+          Poll::Ready(())
+        } else {
+          shared_state.waker = Some(cx.waker().clone());
+          Poll::Pending
+        }
+      }
+    }    
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{SleepFuture的实现}
+
+  {
+    \scriptsize
+    \begin{minted}{rust}
+    pub(crate) fn tick(&self, cpu_id: usize, tid: Option<Tid>) -> bool {
+      if cpu_id == 0 {
+        // ...
+        while let Some(event) = timer.pop() {
+          match event {
+            Event::Wakeup(tid) => {
+              let mut states = self.timer_states.lock();
+              let shared_state = states.remove(&tid);
+              if let Some(shared_state) = shared_state {
+                let mut shared_state = shared_state.lock();
+                self.set_status(tid, Status::Ready);
+                if let Some(waker) = shared_state.waker.take() {
+                  waker.wake()
+                }
+              }
+            }
+          }
+        }
+      }
+      // ...
+    }
+  \end{minted}
+  }
+
+  这只是一个初步的实现。进一步可以考虑将Event改写，因为一个线程可能不止一个sleep。
+\end{frame}
+
 \begin{frame}
   \frametitle{Progress?}
 
@@ -168,5 +275,5 @@
     \item 调查了之前社区进行的工作
   \end{itemize}
 \end{frame}
-  
+
 \end{document}
