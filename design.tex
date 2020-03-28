@@ -175,6 +175,13 @@
       type Output;
       fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>;
     }
+
+    pub struct Context<'a> { /* fields omitted */ }
+
+    impl<'a> Context<'a> {
+      pub fn from_waker(waker: &'a Waker) -> Context<'a>;
+      pub fn waker(&self) -> &'a Waker;
+    }
   \end{minted}
   }
 \end{frame}
@@ -182,7 +189,7 @@
 \begin{frame}[fragile]
   \frametitle{SleepFuture的实现}
 
-  如何把Future与已经实现的timer结合起来？
+  如何把Future与已经实现的timer结合起来？首先需要一个具体的SleepFuture结构。
   {
   \scriptsize
   \begin{minted}{rust}
@@ -240,21 +247,15 @@
     \scriptsize
     \begin{minted}{rust}
     pub(crate) fn tick(&self, cpu_id: usize, tid: Option<Tid>) -> bool {
-      if cpu_id == 0 {
-        // ...
-        while let Some(event) = timer.pop() {
-          match event {
-            Event::Wakeup(tid) => {
-              let mut states = self.timer_states.lock();
-              let shared_state = states.remove(&tid);
-              if let Some(shared_state) = shared_state {
-                let mut shared_state = shared_state.lock();
-                self.set_status(tid, Status::Ready);
-                if let Some(waker) = shared_state.waker.take() {
-                  waker.wake()
-                }
-              }
-            }
+      // ...
+      Event::Wakeup(tid) => {
+        let mut states = self.timer_states.lock();
+        let shared_state = states.remove(&tid);
+        if let Some(shared_state) = shared_state {
+          let mut shared_state = shared_state.lock();
+          self.set_status(tid, Status::Ready);
+          if let Some(waker) = shared_state.waker.take() {
+            waker.wake()
           }
         }
       }
@@ -263,7 +264,7 @@
   \end{minted}
   }
 
-  这只是一个初步的实现。进一步可以考虑将Event改写，因为一个线程可能不止一个sleep。
+  这只是一个初步的实现。进一步可以考虑将ThreadPool改写，因为一个线程可能不止一个async任务，因此需要将调度的单位从Tid转为Waker。
 \end{frame}
 
 \begin{frame}
