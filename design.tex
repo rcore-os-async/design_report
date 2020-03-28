@@ -16,7 +16,34 @@
 \end{frame}
 
 \begin{frame}[fragile]
-  \frametitle{What are we doing?}
+  \frametitle{Rust的Future架构}
+
+  Rust只提供Future等一系列基础类型，最重要的是Future。
+  {
+  \scriptsize
+  \begin{minted}{rust}
+    pub enum Poll<T> {
+      Ready(T),
+      Pending,
+    }
+
+    pub trait Future {
+      type Output;
+      fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>;
+    }
+
+    pub struct Context<'a> { /* fields omitted */ }
+
+    impl<'a> Context<'a> {
+      pub fn from_waker(waker: &'a Waker) -> Context<'a>;
+      pub fn waker(&self) -> &'a Waker;
+    }
+  \end{minted}
+  }
+\end{frame}
+
+\begin{frame}[fragile]
+  \frametitle{Rust的Future架构 Cont.}
 
   Rust 有一个叫做 Async 的东西
 
@@ -160,33 +187,6 @@
 \end{frame}
 
 \begin{frame}[fragile]
-  \frametitle{Rust的Future架构}
-
-  Rust只提供Future等一系列基础类型，最重要的是Future。
-  {
-  \scriptsize
-  \begin{minted}{rust}
-    pub enum Poll<T> {
-      Ready(T),
-      Pending,
-    }
-
-    pub trait Future {
-      type Output;
-      fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>;
-    }
-
-    pub struct Context<'a> { /* fields omitted */ }
-
-    impl<'a> Context<'a> {
-      pub fn from_waker(waker: &'a Waker) -> Context<'a>;
-      pub fn waker(&self) -> &'a Waker;
-    }
-  \end{minted}
-  }
-\end{frame}
-
-\begin{frame}[fragile]
   \frametitle{SleepFuture的实现}
 
   如何把Future与已经实现的timer结合起来？首先需要一个具体的SleepFuture结构。
@@ -269,12 +269,24 @@
 
 \begin{frame}
   \frametitle{Progress?}
-
   \begin{itemize}
-    \item 实现了 Timer, Channel, Executor 的底层数据结构
+    \item Timer 和 Queue 的数据结构以及相应的性能测试。
+    \item 实现了 Timer 部分暴露的异步接口。
+    \item 实现了一个 \texttt{no\_std} 下的单线程 Executor。
     \item API 设计
     \item 调查了之前社区进行的工作
   \end{itemize}
+
+  \pause
+  \vspace{2em}
+
+  我们目前的分工是
+  \begin{description}
+    \item[王宇逸] 基本异步组件的实现，相关的数据结构
+    \item[刘晓义] Executor 和调度器算法，相关的数据结构
+  \end{description}
+
+  未来在编写上层应用的时候再进行进一步的分工。
 \end{frame}
 
 \end{document}
