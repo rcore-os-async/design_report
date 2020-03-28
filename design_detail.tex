@@ -1,0 +1,219 @@
+\documentclass[UTF-8]{ctexart}
+\usepackage[cache=false]{minted}
+\usepackage{listings}
+\usepackage{caption}
+
+\title{First-class async in rCore - 设计方案文档}
+
+\author{g01 - 王宇逸, 刘晓义}
+\date{2020-3}
+
+\begin{document}
+\maketitle
+
+\section{课程设计目标}
+  探索使用 Rust 的 First-class async/await 语言特性编写操作系统内核的优势和缺点，并利用这些经验优化 rCore 部分模块的性能和代码结构。
+
+\section{课程设计背景}
+  Rust 标准库中对异步操作的建模是\textbf{无栈协程}，对应语言标准中的 \texttt{struct core::future::Future}。此外，Rust 对基于 Future 的异步操作提供了语言特性层面的支持，通过同步形式的代码编写异步程序，如代码片段 \ref{src:async} 所示。
+
+  \begin{listing}[H]
+  \begin{minted}{rust}
+    async fn foo() -> u64 {
+      let result = bar().await;
+      println!("Got result: {}", result);
+      result
+    }
+  \end{minted}
+  \caption{Async/await example}
+  \label{src:async}
+  \end{listing}
+
+  类似于使用标准库中的线程建模并发操作需要操作系统支持，执行无栈协程需要使用 Executor 驱动协程。一般而言，Rust 的协程是针对用户态 IO 密集程序设计的，因此社区所提供的 Executor 绝大多数也都是为这一目的设计。我们在 \ref{sec:executor} 一节中具体讨论 Executor 的问题。
+
+  虽然如此，我们认为能够用 Async 和 Future 来抽象内核中的并行工作，因为这种抽象方式有以下的优点：
+
+  \paragraph{静态内存分析:} 如果使用 async 块生成 Future 的话，会由编译器静态决定它所占用的空间，这取决于 yield point 集的内存占用上界。由于协程并不是任何地方都可以被打断，因此可以节约空间。
+
+  \paragraph{内建消息通知机制:} 一般而言，在内核中实现 Executor 需要实现一个通知机制，将阻塞的线程唤醒。Future 定义了标准的消息通知机制，这可以方便内核各个模块解耦。
+
+  \paragraph{撤销机制:} Drop 意味着撤销，因此撤销并行或者组合的异步操作非常简单。强制各个异步服务的提供方支持撤销，方便优化。
+  
+  \vspace{1em}
+  因此，我们认为新的抽象能为操作系统内核提供更好的性能和代码可读性，包括：
+  \begin{itemize}
+    \item 处理同步互斥
+    \item 驱动用户线程
+    \item 处理中断
+  \end{itemize}
+
+  \section{既有社区工作}
+  \subsection{Future 组合子}
+  Rust 社区中 Future 组合子的事实标准来自于 \texttt{futures} crate. 虽然在 Rust 包含 async/await 语言特性之后使用较少，但是在编写异步服务提供的底层 Future 的时候还要用到。
+
+  \subsection{Executor}
+  \label{sec:executor}
+  社区中常用的 Executor 由 \texttt{tokio}, \texttt{async-std} 和 \texttt{futures} 提供。一般而言每个 crate 提供两个版本的 Executor:
+  \begin{itemize}
+    \item Thread local: 单线程执行，FIFO 作为调度算法，可能支持并发唤醒，不适用于支持 SMP 的操作系统。
+    \item Thread pool: 线程池，比较受欢迎的实现方法是 Work stealing queue，由于利用了线程这一抽象，因此无法在调度器内使用。
+  \end{itemize}
+
+  其他的一些 \texttt{no\_std} 环境内的 Executor 提供阻塞在单一 Future 的执行方法，这也不符合调度器内的用例。
+
+  因此，我们需要自己编写一个适合操作系统内部使用的 Executor。
+
+  \subsection{Task 抽象}
+  \texttt{async-std} 将其中的 Task 抽象单独提取为一个库，叫做 \texttt{async-task}。这个库抽象了 Future 的执行和并发唤醒。在此之上只需要实现调度器的数据结构即可完成一个 Executor。
+
+  \subsection{基础异步组件实现}
+  部分内核中的基本异步组件有比较好的实现：
+  
+  \paragraph{Timer} Node.js 和 Tokio 内部使用一个 Hierarchical timer wheel，可以从一个基本时钟派生出多个时钟，为内核的其他组件提供计时器支持，这一算法的复杂度是线性的。Linux 内部也使用了类似算法。
+
+  \paragraph{Queue} 来自 Facebook 的开源 C++ 库 Folly 包含一个高效的无锁 MPMC 实现，这个库所提供的保证正好符合内核中 Run queue 的需求，而且性能非常高。去掉其中部分同步操作，可以变成更优化的 SPMC 或者 MPSC。
+  
+  \paragraph{Mutex} Linux 的 FUTEX syscall，以及 glibc 中 Mutex 和 Condvar 的实现有很好的参考作用。
+
+  \section{工作计划和 API 设计}
+  我们预计的工作计划是
+
+  \begin{enumerate}
+    \item 将 rCore 划分为异步服务提供方、Executor 和异步服务使用方，\textbf{完全}使用 Future 抽象这三者之间的交互。
+    \item 首先实现基本的计时器、调度器以及用户态线程支持，验证以上抽象是否可行。
+    \item 将其他 OS 组件尝试切换到新的抽象上来。
+  \end{enumerate}
+
+  我们初步的 API 设计如代码片段 \ref{src:api} 所示。
+
+  \begin{listing}[H]
+  \begin{minted}[linenos,breaklines]{rust}
+    fn irq::wait_for(int: Interrupt) -> impl Future<Item = InterruptInfo>;
+    fn timer::timeout(dur: Duration) -> impl Future<Item = InterruptInfo>;
+
+    enum ut::Event { Syscall(Syscall), TimeUp, Signal(Signal) }
+    impl ut::UserThread {
+      fn run() -> impl Future<Item = Event>;
+    }
+
+    impl<T: Sync> sync::Mutex<T> {
+      fn wait_until<F: Fn(&mut self, &mut T) -> bool>(pred: F)
+        -> impl Future<Item = Guard<T>>;
+    }
+
+    impl exec::Executor {
+      fn spawn(fut: Future<Item = ()>);
+    }
+    fn exec::yield() -> impl Future<Item = ()>;
+  \end{minted}
+
+  \caption{API 设计}
+  \label{src:api}
+  \end{listing}
+
+  对这一 API 中 Timer 的实现，以及在这一组 API 之上实现的创建用户线程示例可以参考附录 \ref{sec:code} 中代码片段 \ref{src:sleep_future} 和 \ref{src:create_user_thread} 的实现。
+
+  \section{分工及已完成工作}
+  我们目前的分工是
+  \begin{description}
+    \item[王宇逸] 基本异步组件的实现，相关的数据结构
+    \item[刘晓义] Executor 和调度器算法，相关的数据结构
+  \end{description}
+
+  未来在编写上层应用的时候再进行进一步的分工。
+
+  \vspace{2em}
+
+  已完成的工作包括：
+  \begin{itemize}
+    \item Timer 和 Queue 的数据结构以及相应的性能测试。
+    \item 实现了 Timer 部分暴露的异步接口。
+    \item 实现了一个 \texttt{no\_std} 下的单线程 Executor。
+  \end{itemize}
+
+  \appendix
+  \section{代码片段}
+  \label{sec:code}
+
+  {
+  \begin{minted}{rust}
+    struct SleepFuture {
+      pub shared_state: Arc<Mutex<SleepSharedState>>,
+    }
+
+    struct SleepSharedState {
+      completed: bool,
+      waker: Option<Waker>,
+    }
+
+    impl SleepFuture {
+      pub fn new() -> Self {
+        let shared_state = Arc::new(Mutex::new(SleepSharedState {
+          completed: false,
+          waker: None,
+        }));
+        SleepFuture {
+          shared_state: shared_state,
+        }
+      }
+    }
+
+    impl Future for SleepFuture {
+      type Output = ();
+      fn poll(self: Pin<&mut Self>, cx: &mut FutureContext<'_>) -> Poll<Self::Output> {
+        let mut shared_state = self.shared_state.lock();
+        if shared_state.completed {
+          Poll::Ready(())
+        } else {
+          shared_state.waker = Some(cx.waker().clone());
+          Poll::Pending
+        }
+      }
+    }    
+
+    pub(crate) fn tick(&self, cpu_id: usize, tid: Option<Tid>) -> bool {
+      // ...
+      Event::Wakeup(tid) => {
+        let mut states = self.timer_states.lock();
+        let shared_state = states.remove(&tid);
+        if let Some(shared_state) = shared_state {
+          let mut shared_state = shared_state.lock();
+          self.set_status(tid, Status::Ready);
+          if let Some(waker) = shared_state.waker.take() {
+            waker.wake()
+          }
+        }
+      }
+      // ...
+    }
+  \end{minted}
+  \captionof{listing}{Timer 异步 API
+    \label{src:sleep_future}
+  }
+  }
+
+  \begin{listing}
+  \begin{minted}{rust}
+    async fn create_user_thread(us: UserThread, sig: Signals) {
+      match us.run().await {
+        Event::TimeUp => yield().await;
+        Event::Syscall(Syscall::Exit(code)) => {
+          us.notify_waiter(/* ... */);
+          return;
+        },
+        Event::Syscall(Syscall::Sleep(spec)) => {
+          let dur: Duration = spec.into();
+          timer::timeout(dur).await;
+        }
+        Event::Signal(Signal::Kill) => {
+          us.notify_waiter(/* ... */);
+          return ();
+        }
+        // ...
+      }
+    }
+  \end{minted}
+  \caption{创建用户线程}
+  \label{src:create_user_thread}
+  \end{listing}
+\end{document}
