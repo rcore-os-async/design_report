@@ -1,0 +1,53 @@
+\documentclass[UTF-8]{ctexbeamer}
+\usetheme{Boadilla}
+
+\usepackage{listing}
+\usepackage[cache=false]{minted}
+
+\title{First-class async in rCore}
+\subtitle{Pre-Final report}
+
+\author{g01 - 王宇逸, 刘晓义}
+\date{2020-3}
+
+\begin{document}
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}
+  \frametitle{What is this}
+
+  我们希望能够用 Async 和 Future 来完成内核中的并行工作，包括：
+  \begin{itemize}
+    \item 处理同步互斥
+    \item 驱动用户线程
+    \item 处理中断
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \frametitle{What have been done}
+
+  到目前为止的工作包括
+  \begin{itemize}
+    \item 实现了一些基础的数据结构
+    \item 在 rCore tutorial 之上有一个例子
+    \item zCore
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \frametitle{What's being done}
+
+   正在为 zCore 添加 SMP 支持
+
+   \pause
+   \vspace{1em}
+
+   \textbf{Why?}
+
+   目前 zCore 的 executor (\texttt{Mutex<VecDeque>}) 在单核下已经没有很大的优化空间了。而我们的数据结构是针对多核 Stealing queue 使用环境进行优化。
+\end{frame}
+
+\end{document}
