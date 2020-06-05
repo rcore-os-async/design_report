@@ -70,21 +70,25 @@
     \begin{minted}{rust}
     fn spawn(thread: Arc<Thread>) {
       // ...
-      loop {
-        // ...
-        match cx.trap_num {
-          0x100 => exit = handle_syscall(&thread, &mut cx.general).await,
-          0x20..=0x3f => {
-            // Interrupt/Timer
+      let future = async move {
+        kernel_hal::Thread::set_tid(thread.id(), thread.proc().id());
+        loop {
+          // ...
+          match cx.trap_num {
+            0x100 => exit = handle_syscall(&thread, &mut cx.general).await,
+            0x20..=0x3f => {
+              // Interrupt/Timer
+            }
+            0xe => {
+              // Page fault
+            }
+            _ => panic!("not supported interrupt from user mode. {:#x?}", cx),
           }
-          0xe => {
-            // Page fault
-          }
-          _ => panic!("not supported interrupt from user mode. {:#x?}", cx),
+          // ...
         }
         // ...
-      }
-      // ...
+      };
+      kernel_hal::Thread::spawn(Box::pin(future), vmtoken);
     }
   \end{minted}
   }
