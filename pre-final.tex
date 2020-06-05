@@ -3,12 +3,13 @@
 
 \usepackage{listing}
 \usepackage[cache=false]{minted}
+\usepackage{tikz}
 
 \title{First-class async in rCore}
-\subtitle{Pre-Final report}
+\subtitle{Final report}
 
 \author{g01 - 王宇逸, 刘晓义}
-\date{2020-3}
+\date{2020-6}
 
 \begin{document}
 \begin{frame}
@@ -23,31 +24,86 @@
     \item 处理同步互斥
     \item 驱动用户线程
     \item 处理中断
+    \item 实现多核 CPU 支持
   \end{itemize}
 \end{frame}
 
 \begin{frame}
   \frametitle{What have been done}
 
-  到目前为止的工作包括
-  \begin{itemize}
-    \item 实现了一些基础的数据结构
-    \item 在 rCore tutorial 之上有一个例子
-    \item zCore
-  \end{itemize}
+  \tikzstyle{block} = [rectangle, draw, fill=blue!20, text centered, rounded corners, minimum width=2.5cm]
+  \tikzstyle{line} = [draw, -latex]
+
+  \begin{tikzpicture}
+    \node[block](wheel){Timing Wheel};
+    \node[block, right of=wheel, node distance=3cm](executor){Executor};
+    \node[block, above of=executor](queueue){MPMC Queue};
+    \node[block, right of=executor, node distance=3cm](timeout){Futures};
+    \node[block, right of=timeout, node distance=3cm](tutorial){rcore-tutorial};
+    \node[block, below of=executor](zcore){zCore};
+    \node[block, right of=zcore, node distance=3cm](smp){SMP};
+
+    \path[line](queueue)--(executor);
+    \path[line](wheel)--(executor);
+    \path[line](executor)--(timeout);
+    \path[line](timeout)--(tutorial);
+    \path[line, dashed](executor)--(zcore);
+    \path[line](zcore)--(smp);
+  \end{tikzpicture}
 \end{frame}
 
 \begin{frame}
-  \frametitle{What's being done}
+  \frametitle{Why zCore}
 
-   正在为 zCore 添加 SMP 支持
+  \begin{itemize}
+    \item 目标相同：在 async rust 的基础上构建系统内核
+    \item 思路相同：使用 future 的概念替代用户进程/线程
+    \item 上手较易：处于初级活跃开发阶段，而且还没有 SMP 支持
+  \end{itemize}
+\end{frame}
 
-   \pause
-   \vspace{1em}
+\begin{frame}[fragile]
+  \frametitle{async in zCore}
 
-   \textbf{Why?}
+  {
+    \scriptsize
+    \begin{minted}{rust}
+    fn spawn(thread: Arc<Thread>) {
+      // ...
+      loop {
+        // ...
+        match cx.trap_num {
+          0x100 => exit = handle_syscall(&thread, &mut cx.general).await,
+          0x20..=0x3f => {
+            // Interrupt/Timer
+          }
+          0xe => {
+            // Page fault
+          }
+          _ => panic!("not supported interrupt from user mode. {:#x?}", cx),
+        }
+        // ...
+      }
+      // ...
+    }
+  \end{minted}
+  }
+\end{frame}
 
-   目前 zCore 的 executor (\texttt{Mutex<VecDeque>}) 在单核下已经没有很大的优化空间了。而我们的数据结构是针对多核 Stealing queue 使用环境进行优化。
+\begin{frame}
+  \frametitle{SMP 支持}
+
+  已经为 zCore 添加了 SMP 支持。
+
+  \pause
+  \vspace{1em}
+
+  \textbf{解决的问题}
+
+  \begin{itemize}
+    \item 让 queueue 支持动态增长
+    \item 使用 x86 核心唤醒机制
+  \end{itemize}
 \end{frame}
 
 \end{document}
