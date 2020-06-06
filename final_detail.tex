@@ -1,0 +1,148 @@
+\documentclass[UTF-8]{ctexart}
+\usepackage{listing}
+\usepackage[cache=false]{minted}
+\usepackage{tikz}
+
+\title{First-class async in rCore}
+\author{g01 - 王宇逸, 刘晓义}
+\date{2020-6}
+
+\begin{document}
+\maketitle
+
+\section{设计背景}
+Rust 标准库中对异步操作的建模是\textbf{无栈协程}，对应语言标准中的 \texttt{struct core::future::Future}。此外，Rust 对基于 Future 的异步操作提供了语言特性层面的支持，通过同步形式的代码编写异步程序，如代码片段 \ref{src:async} 所示。
+
+\begin{listing}[H]
+    \begin{minted}{rust}
+    async fn foo() -> u64 {
+      let result = bar().await;
+      println!("Got result: {}", result);
+      result
+    }
+  \end{minted}
+    \caption{Async/await example}
+    \label{src:async}
+\end{listing}
+
+类似于使用标准库中的线程建模并发操作需要操作系统支持，执行无栈协程需要使用 Executor 驱动协程。一般而言，Rust 的协程是针对用户态 IO 密集程序设计的，因此社区所提供的 Executor 绝大多数也都是为这一目的设计。我们在 \ref{sec:executor} 一节中具体讨论 Executor 的问题。
+
+虽然如此，我们认为能够用 Async 和 Future 来抽象内核中的并行工作，因为这种抽象方式有以下的优点：
+
+\paragraph{静态内存分析:} 如果使用 async 块生成 Future 的话，会由编译器静态决定它所占用的空间，这取决于 yield point 集的内存占用上界。由于协程并不是任何地方都可以被打断，因此可以节约空间。
+
+\paragraph{内建消息通知机制:} 一般而言，在内核中实现 Executor 需要实现一个通知机制，将阻塞的线程唤醒。Future 定义了标准的消息通知机制，这可以方便内核各个模块解耦。
+
+\paragraph{撤销机制:} Drop 意味着撤销，因此撤销并行或者组合的异步操作非常简单。强制各个异步服务的提供方支持撤销，方便优化。
+
+\vspace{1em}
+因此，我们认为新的抽象能为操作系统内核提供更好的性能和代码可读性，包括：
+\begin{itemize}
+    \item 处理同步互斥
+    \item 驱动用户线程
+    \item 处理中断
+    \item 实现多核 CPU 支持
+\end{itemize}
+
+\section{设计完成示意}
+\tikzstyle{block} = [rectangle, draw, fill=blue!20, text centered, rounded corners, minimum width=2.5cm]
+\tikzstyle{line} = [draw, -latex]
+
+\begin{tikzpicture}
+    \node[block](wheel){Timing Wheel};
+    \node[block, right of=wheel, node distance=3cm](executor){Executor};
+    \node[block, above of=executor](queueue){MPMC Queue};
+    \node[block, right of=executor, node distance=3cm](timeout){Futures};
+    \node[block, right of=timeout, node distance=3cm](tutorial){rcore-tutorial};
+    \node[block, below of=executor](zcore){zCore};
+    \node[block, right of=zcore, node distance=3cm](smp){SMP};
+
+    \path[line](queueue)--(executor);
+    \path[line](wheel)--(executor);
+    \path[line](executor)--(timeout);
+    \path[line](timeout)--(tutorial);
+    \path[line, dashed](executor)--(zcore);
+    \path[line](zcore)--(smp);
+\end{tikzpicture}
+
+\section{zCore}
+\subsection{Why zCore}
+在经过考察后，我们认为在 zCore 基础上继续 async os 的开发工作是可行的。
+
+\paragraph{目标相同：}zCore 在 async rust 的基础上构建系统内核。
+\paragraph{思路相同：}使用 future 的概念替代用户进程/线程，详见下面的分析。
+\paragraph{上手较易：}处于初级活跃开发阶段，而且还没有 SMP 支持。
+
+\subsection{async in zCore}
+
+\begin{listing}[H]
+    \begin{minted}{rust}
+fn spawn(thread: Arc<Thread>) {
+  // ...
+  let future = async move {
+    kernel_hal::Thread::set_tid(thread.id(),
+      thread.proc().id());
+    loop {
+      // ...
+      match cx.trap_num {
+        0x100 => exit = handle_syscall(&thread,
+          &mut cx.general).await,
+        0x20..=0x3f => {
+          // Interrupt/Timer
+        }
+        0xe => {
+          // Page fault
+        }
+        _ => panic!(
+          "not supported interrupt from user mode. {:#x?}",
+          cx),
+      }
+      // ...
+    }
+    // ...
+  };
+  kernel_hal::Thread::spawn(Box::pin(future), vmtoken);
+}
+    \end{minted}
+    \caption{Root Future in zCore}
+    \label{src:zcore}
+\end{listing}
+
+可以看出，zCore 的用户线程实际上是一个根级（root）Future，这个 Future 直接被提交到 Executor 中进行调度。
+
+用户线程 Future 的工作是一个无限循环，处理各种由用户态进入内核态的可能发生的事件，包括系统调用、中断和页面错误。
+
+\section{Executor}
+\label{sec:executor}
+\subsection{作用与保证}
+Executor 担任了内核中的 Scheduler 的功能。在重用各种 Scheduler 的算法的同时，为 async 机制提供 runtime。
+
+使用 Executor 的优点包括：
+\paragraph{Waker 不遗失：}Waker 本质上是一个更加复杂的异步回调（callback）。
+在传统的中断处理机制中，为了确保实现正确，可能会暂时关闭中断，这就可能导致对于中断响应的遗失。
+使用 async 机制，尽管不能减少处理中断的耗时，但是所有的任务都会被添加到队列。
+\paragraph{一致性：}Executor 对于任何 async 任务的调度是一致的，不论是时钟中断、外设中断、页面错误（page fault）、系统调用，
+在 Executor 看来都是一个个任务。这给更高层次的抽象，如 async-task 包的工作，提供了便利。
+\paragraph{解耦合：}Executor 作为底层 runtime，和上层的使用是解耦合的。
+一个使用 async 机制的操作系统可以根据需要使用不同的 Executor，而 Executor 的实现也不需要考虑操作系统的实现细节。
+考虑到未来商业操作系统的发展方向之一，也是将与 CPU 等硬件相关的调度工作与操作系统的上层实现解耦，让硬件厂商提供相应的调度实现，来得到更高的性能。
+Executor 很好地实现了这一目标。
+\subsection{Stealing Queue}
+我们实现的 Executor 的基础是一个 MPMC Queue，这是由 Folly 的免锁动态队列改写而来。这样的队列具有如下特点：
+\paragraph{动态增长：}在之前的实现中，这是一个静态队列。一旦出现高密度的任务提交，会快速填满队列，导致卡死。
+这次的队列继续参考 Folly 的实现，是可以动态并无限增长的。
+\paragraph{高并发：}尽管队列增长的过程中，需要一定的同步机制保证正确性。
+但是在增长前和增长后，向队列中添加任务是并发免锁的，亦即支持高并发的任务提交。
+
+\section{SMP 支持}
+由于 zCore 的 RISC-V 实现并不完全，我们最终决定在 x86\_64 架构下添加 SMP 支持。
+在这个过程中我们遇到了许多问题，有些仍待解决。
+
+\paragraph{UEFI 的局限性：}UEFI 支持一种“多任务处理”机制，即提供启动多个 CPU 核心的接口。然而在 UEFI 程序退出时，各个由 BSP 启动的 AP 会被 halt。
+也就是说，使用 UEFI 提供好的接口不能直接实现 SMP。
+\paragraph{页表的同步：}如果自己实现 bootloader，我们会清楚地掌握实模式、保护模式和长模式下的页表结构和地址，从而可以较为简单地实现页表同步。
+然而现在操作系统发展的方向是 UEFI 启动，而从实模式到长模式的工作是 UEFI 完成的。
+那么启动的 AP 还要从实模式开始演化，就需要与 UEFI 进行某种配合，或者沿着 UEFI 初始化的路线重新走一遍。
+这部分的代码需要手动完成，而且是汇编代码。
+
+\end{document}
